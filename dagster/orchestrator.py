@@ -177,3 +177,26 @@ def log_failure_to_snowflake(context: RunStatusSensorContext):
             "error_message": context.failure_event.step_failure_data.error.message
         }
     write_run_to_snowflake(context, status="FAILURE", error_msg=error_data)
+
+
+    # 6. JOB + SCHEDULE
+run_customer_pipeline = define_asset_job(
+    name="trigger_customer_dbt_cloud_job",
+    selection=AssetSelection.all(),
+    executor_def=in_process_executor,
+)
+
+daily_schedule = ScheduleDefinition(
+    job=run_customer_pipeline,
+    cron_schedule="0 6 * * *",
+    execution_timezone="UTC",
+)
+
+
+# 7. REGISTER EVERYTHING
+defs = Definitions(
+    assets=[customer, raw_customers, stg_customers, dim_customers],
+    jobs=[run_customer_pipeline],
+    schedules=[daily_schedule],
+    sensors=[log_success_to_snowflake, log_failure_to_snowflake],
+)

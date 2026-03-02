@@ -40,19 +40,16 @@ def trigger_dbt_cloud_job():
     }
     body = {"cause": "Triggered by Dagster"}
 
-    # Trigger the job
     response = requests.post(url, headers=headers, json=body)
     response.raise_for_status()
     run_id = response.json()["data"]["id"]
 
-    # Poll for completion
     poll_url = f"{DBT_CLOUD_HOST}/api/v2/accounts/{DBT_CLOUD_ACCOUNT_ID}/runs/{run_id}/"
     while True:
         poll_response = requests.get(poll_url, headers=headers)
         poll_response.raise_for_status()
         status = poll_response.json()["data"]["status"]
 
-        # 10 = Success, 20 = Error, 30 = Cancelled
         if status == 10:
             return run_id, "SUCCESS"
         elif status in (20, 30):
@@ -133,7 +130,7 @@ def write_run_to_snowflake(
         run_id = context.dagster_run.run_id
         job_name = context.dagster_run.job_name
         stats = context.instance.get_run_stats(run_id)
-        error_json = json.dumps(error_msg) if error_msg else "{}"
+        error_json = json.dumps(error_msg) if error_msg else None
 
         cursor.execute(
             """
@@ -143,7 +140,7 @@ def write_run_to_snowflake(
             VALUES (%s, %s, %s,
                     TO_TIMESTAMP_NTZ(%s),
                     TO_TIMESTAMP_NTZ(%s),
-                    PARSE_JSON(%s))
+                    %s)
             """,
             (run_id, job_name, status,
              stats.start_time, stats.end_time, error_json),
@@ -179,7 +176,7 @@ def log_failure_to_snowflake(context: RunStatusSensorContext):
     write_run_to_snowflake(context, status="FAILURE", error_msg=error_data)
 
 
-    # 6. JOB + SCHEDULE
+# 6. JOB + SCHEDULE
 run_customer_pipeline = define_asset_job(
     name="trigger_customer_dbt_cloud_job",
     selection=AssetSelection.all(),

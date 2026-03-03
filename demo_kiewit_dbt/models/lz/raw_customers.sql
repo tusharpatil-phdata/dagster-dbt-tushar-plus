@@ -15,3 +15,4 @@ select
     'customer.csv' as _source_file
 from {{ source('raw_customers', 'CUSTOMER') }}
 
+

@@ -14,6 +14,20 @@ snapshot-paths: [snapshots]
 target-path: target
 clean-targets: [target, dbt_packages]
 
+groups:
+  - name: source
+    owner:
+      name: kiewit_team
+  - name: bronze
+    owner:
+      name: kiewit_team
+  - name: silver
+    owner:
+      name: kiewit_team
+  - name: gold
+    owner:
+      name: kiewit_teams
+
 seeds:
   demo_kiewit_dbt:
     customer:
@@ -23,6 +37,7 @@ seeds:
       +column_types:
         id: varchar(36)
         name: varchar(100)
+      +group: source
 
 models:
   demo_kiewit_dbt:
@@ -31,13 +46,16 @@ models:
       +schema: lz
       +materialized: table
       +tags: [lz, bronze]
+      +group: bronze
     staging:
       +database: DAGSTER_DBT_KIEWIT_DB
       +schema: staging
       +materialized: view
       +tags: [staging, silver]
+      +group: silver
     dbo:
       +database: DAGSTER_DBT_KIEWIT_DB
       +schema: dbo
       +materialized: table
       +tags: [dbo, gold]
+      +group: gold

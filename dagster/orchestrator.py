@@ -159,6 +159,35 @@ def fetch_dbt_run_results(context):
         if conn:
             conn.close()
 
+# 4c. TRIGGER dbt RETRY JOB ON FAILURE
+def trigger_dbt_retry(context):
+    """Trigger the dbt retry job to rerun only failed models."""
+    import requests
+
+    host = os.getenv("DBT_CLOUD_HOST")
+    account_id = os.getenv("DBT_CLOUD_ACCOUNT_ID")
+    token = os.getenv("DBT_CLOUD_API_TOKEN")
+    retry_job_id = os.getenv("DBT_RETRY_JOB_ID")
+
+    if not retry_job_id:
+        context.log.warning("DBT_RETRY_JOB_ID not set, skipping retry")
+        return
+
+    headers = {
+        "Authorization": f"Token {token}",
+        "Content-Type": "application/json",
+    }
+
+    url = f"{host}/api/v2/accounts/{account_id}/jobs/{retry_job_id}/run/"
+    body = {"cause": "Auto-retry triggered by Dagster on failure"}
+
+    response = requests.post(url, headers=headers, json=body)
+    response.raise_for_status()
+    run_id = response.json()["data"]["id"]
+    context.log.info(f"  Retry job triggered! dbt Cloud Run ID: {run_id}")
+    context.log.info(f"  Only failed models from the last run will be re-executed.")
+
+
 # 5. SENSORS (auto-start)
 @run_status_sensor(
     run_status=DagsterRunStatus.SUCCESS,
@@ -179,6 +208,10 @@ def log_failure_to_snowflake(context: RunStatusSensorContext):
             "error_message": context.failure_event.step_failure_data.error.message
         }
     write_run_to_snowflake(context, status="FAILURE", error_msg=error_data)
+    try:
+        trigger_dbt_retry(context)
+    except Exception as e:
+        context.log.warning(f"Could not trigger retry job: {e}")
 
 @run_status_sensor(
     run_status=DagsterRunStatus.SUCCESS,

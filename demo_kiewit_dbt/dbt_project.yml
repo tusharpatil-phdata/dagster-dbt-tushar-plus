@@ -45,4 +45,3 @@ models:
       +materialized: table
       +tags: [dbo, gold]
       +group: gold
-

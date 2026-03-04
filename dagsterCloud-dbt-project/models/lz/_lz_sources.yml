@@ -1,0 +1,32 @@
+version: 2
+
+
+sources:
+  - name: raw_customers
+    description: 'Raw Jaffle Shop CSV loaded via dbt seed into SOURCE schema'
+    database: DAGSTER_DBT_KIEWIT_DB
+    schema: SOURCE
+    tables:
+      - name: CUSTOMER
+        description: 'Seed table - CSV as-is'
+        columns:
+          - name: ID
+            tests:
+              - not_null
+              - unique
+          - name: NAME
+            tests:
+              - not_null
+
+
+models:
+  - name: raw_customers
+    description: 'Bronze model - LZ.RAW_CUSTOMERS'
+    columns:
+      - name: customer_id
+        tests:
+          - not_null
+          - unique
+      - name: full_name
+        tests:
+          - not_null

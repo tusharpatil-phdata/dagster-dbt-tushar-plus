@@ -1,0 +1,15 @@
+version: 2
+
+groups:
+  - name: source
+    owner:
+      name: kiewit_team
+  - name: bronze
+    owner:
+      name: kiewit_team
+  - name: silver
+    owner:
+      name: kiewit_team
+  - name: gold
+    owner:
+      name: kiewit_team

@@ -1,0 +1,14 @@
+version: 2
+
+
+models:
+  - name: dim_customers
+    description: 'Gold dimension - analytics-ready customer table'
+    columns:
+      - name: customer_id
+        tests:
+          - not_null
+          - unique
+      - name: full_name
+        tests:
+          - not_null

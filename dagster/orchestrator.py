@@ -188,6 +188,85 @@ def trigger_dbt_retry(context):
     context.log.info(f"  Only failed models from the last run will be re-executed.")
 
 
+# 4d. LOG RECORD COUNTS TO SNOWFLAKE
+def log_record_counts(context):
+    """
+    After every successful run:
+    1. Query each layer table for current row count
+    2. Look up previous run's row count from LAYER_ROW_COUNTS table
+    3. Calculate rows added (current - previous)
+    4. Log to Dagster UI (visible in Automation tab)
+    5. Save to Snowflake LAYER_ROW_COUNTS table (full history)
+    """
+    conn = None
+    try:
+        conn = snowflake.connector.connect(
+            user=os.getenv("SNOWFLAKE_USER"),
+            password=os.getenv("SNOWFLAKE_PASSWORD"),
+            account=os.getenv("SNOWFLAKE_ACCOUNT"),
+            warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
+            database="DAGSTER_DBT_KIEWIT_DB",
+        )
+        cursor = conn.cursor()
+        dagster_run_id = context.dagster_run.run_id
+
+        # All 4 layer tables we want to track
+        tables = [
+            ("SOURCE", "CUSTOMER"),        # Seed layer
+            ("LZ", "RAW_CUSTOMERS"),       # Bronze layer
+            ("STAGING", "STG_CUSTOMERS"),   # Silver layer (VIEW)
+            ("DBO", "DIM_CUSTOMERS"),       # Gold layer
+        ]
+
+        context.log.info("--- Record Counts ---")
+        for schema, table in tables:
+
+            # Step 1: Get current row count
+            cursor.execute(f"SELECT COUNT(*) FROM {schema}.{table}")
+            rows_after = cursor.fetchone()[0]
+
+            # Step 2: Get previous run's row count from tracking table
+            cursor.execute(
+                """
+                SELECT ROWS_AFTER FROM SANDBOX.METRICS.LAYER_ROW_COUNTS
+                WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s
+                ORDER BY LOGGED_AT DESC LIMIT 1
+                """,
+                (schema, table),
+            )
+            prev = cursor.fetchone()
+            rows_before = prev[0] if prev else 0  # First run = 0
+
+            # Step 3: Calculate difference
+            rows_added = rows_after - rows_before
+
+            # Step 4: Save to Snowflake with IST timestamp
+            cursor.execute(
+                """
+                INSERT INTO SANDBOX.METRICS.LAYER_ROW_COUNTS
+                  (DAGSTER_RUN_ID, SCHEMA_NAME, TABLE_NAME,
+                   ROWS_BEFORE, ROWS_AFTER, ROWS_ADDED, LOGGED_AT)
+                VALUES (%s, %s, %s, %s, %s, %s,
+                    CONVERT_TIMEZONE('America/Los_Angeles', 'Asia/Kolkata', CURRENT_TIMESTAMP()))
+                """,
+                (dagster_run_id, schema, table,
+                 rows_before, rows_after, rows_added),
+            )
+
+            # Step 5: Log to Dagster UI
+            context.log.info(
+                f"  {schema}.{table}: {rows_before:,} -> {rows_after:,} ({rows_added:+,} rows)"
+            )
+
+        conn.commit()
+        context.log.info("  Row counts logged to SANDBOX.METRICS.LAYER_ROW_COUNTS")
+
+    except Exception as e:
+        context.log.error(f"Record count failed: {e}")
+    finally:
+        if conn:
+            conn.close()
+
 # 5. SENSORS (auto-start)
 @run_status_sensor(
     run_status=DagsterRunStatus.SUCCESS,
@@ -213,6 +292,8 @@ def log_failure_to_snowflake(context: RunStatusSensorContext):
     except Exception as e:
         context.log.warning(f"Could not trigger retry job: {e}")
 
+
+
 @run_status_sensor(
     run_status=DagsterRunStatus.SUCCESS,
     default_status=DefaultSensorStatus.RUNNING,
@@ -221,8 +302,14 @@ def log_success_to_snowflake(context: RunStatusSensorContext):
     write_run_to_snowflake(context, status="SUCCESS")
     try:
         fetch_dbt_run_results(context)
+        log_record_counts(context)
     except Exception as e:
         context.log.warning(f"Could not fetch dbt Cloud details: {e}")
+# This sensor fires after every SUCCESSFUL Dagster run
+# It does 3 things:
+# 1. Logs job status to DAGSTER_JOB_RUNS
+# 2. Fetches per-model results from dbt Cloud -> saves to DBT_MODEL_RUNS
+# 3. Counts rows in all layer tables -> saves to LAYER_ROW_COUNTS
 
 
 # 6. JOB + SCHEDULE

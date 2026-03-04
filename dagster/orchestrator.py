@@ -1,8 +1,10 @@
 import os
 import json
-import snowflake.connector
 import requests
-from dotenv import load_dotenv
+import snowflake.connector
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 
 from dagster import (
     Definitions,
@@ -12,7 +14,6 @@ from dagster import (
     run_status_sensor,
     DagsterRunStatus,
     AssetSelection,
-    in_process_executor,
     DefaultSensorStatus,
 )
 from dagster_dbt import (
@@ -20,10 +21,47 @@ from dagster_dbt import (
     load_assets_from_dbt_cloud_job,
 )
 
+# 1. LOAD SNOWFLAKE PRIVATE KEY (KEY PAIR, NO PASSPHRASE)
+def _load_snowflake_private_key():
+    pem_str = os.getenv("SNOWFLAKE_PRIVATE_KEY_PEM")
+    if not pem_str:
+        raise RuntimeError("SNOWFLAKE_PRIVATE_KEY_PEM not set")
 
-# 1. LOAD SECRETS
-load_dotenv()
+    pem_bytes = pem_str.encode("utf-8")
 
+    private_key = serialization.load_pem_private_key(
+        pem_bytes,
+        password=None,  # no passphrase
+        backend=default_backend(),
+    )
+
+    pkcs8_der = private_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return pkcs8_der
+
+def _snowflake_conn_sandbox():
+    """Connection to SANDBOX_PLUS.METRICS for audit tables."""
+    return snowflake.connector.connect(
+        user=os.getenv("SNOWFLAKE_USER"),
+        account=os.getenv("SNOWFLAKE_ACCOUNT"),
+        warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
+        database="SANDBOX_PLUS",
+        schema="METRICS",
+        private_key=_load_snowflake_private_key(),
+    )
+
+def _snowflake_conn_main():
+    """Connection to DAGSTER_DBT_KIEWIT_DB_PLUS for data row counts."""
+    return snowflake.connector.connect(
+        user=os.getenv("SNOWFLAKE_USER"),
+        account=os.getenv("SNOWFLAKE_ACCOUNT"),
+        warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
+        database="DAGSTER_DBT_KIEWIT_DB_PLUS",
+        private_key=_load_snowflake_private_key(),
+    )
 
 # 2. CONFIGURE dbt CLOUD CONNECTION
 dbt_cloud_connection = dbt_cloud_resource.configured(
@@ -34,13 +72,11 @@ dbt_cloud_connection = dbt_cloud_resource.configured(
     }
 )
 
-
 # 3. AUTO-DISCOVER dbt MODELS FROM dbt CLOUD JOB
 customer_dbt_assets = load_assets_from_dbt_cloud_job(
     dbt_cloud=dbt_cloud_connection,
     job_id=int(os.getenv("DBT_JOB_ID")),
 )
-
 
 # 4. SNOWFLAKE AUDIT LOGGING
 def write_run_to_snowflake(
@@ -50,15 +86,9 @@ def write_run_to_snowflake(
 ):
     conn = None
     try:
-        conn = snowflake.connector.connect(
-            user=os.getenv("SNOWFLAKE_USER"),
-            password=os.getenv("SNOWFLAKE_PASSWORD"),
-            account=os.getenv("SNOWFLAKE_ACCOUNT"),
-            warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
-            database="SANDBOX",
-            schema="METRICS",
-        )
+        conn = _snowflake_conn_sandbox()
         cursor = conn.cursor()
+
         run_id = context.dagster_run.run_id
         job_name = context.dagster_run.job_name
         stats = context.instance.get_run_stats(run_id)
@@ -75,11 +105,10 @@ def write_run_to_snowflake(
                     %s,
                     CONVERT_TIMEZONE('America/Los_Angeles', 'Asia/Kolkata', CURRENT_TIMESTAMP()))
             """,
-            (run_id, job_name, status,
-             stats.start_time, stats.end_time, error_json),
+            (run_id, job_name, status, stats.start_time, stats.end_time, error_json),
         )
         conn.commit()
-        context.log.info(f"Logged {status} to SANDBOX.METRICS")
+        context.log.info(f"Logged {status} to SANDBOX_PLUS.METRICS.DAGSTER_JOB_RUNS")
     except Exception as e:
         context.log.error(f"Snowflake log failed: {e}")
     finally:
@@ -87,10 +116,8 @@ def write_run_to_snowflake(
             conn.close()
 
 # 4b. FETCH dbt CLOUD RUN DETAILS + LOG TO SNOWFLAKE
-def fetch_dbt_run_results(context):
+def fetch_dbt_run_results(context: RunStatusSensorContext):
     """Fetch per-model results from dbt Cloud and log to Snowflake."""
-    import requests
-
     host = os.getenv("DBT_CLOUD_HOST")
     account_id = os.getenv("DBT_CLOUD_ACCOUNT_ID")
     token = os.getenv("DBT_CLOUD_API_TOKEN")
@@ -105,7 +132,7 @@ def fetch_dbt_run_results(context):
     latest_run = run_resp.json()["data"][0]
     dbt_run_id = latest_run["id"]
 
-    # Fetch run results artifact
+    # Fetch run_results.json artifact
     artifact_url = f"{host}/api/v2/accounts/{account_id}/runs/{dbt_run_id}/artifacts/run_results.json"
     art_resp = requests.get(artifact_url, headers=headers)
     art_resp.raise_for_status()
@@ -121,19 +148,14 @@ def fetch_dbt_run_results(context):
 
     passed = sum(1 for r in results if r["status"] in ("success", "pass"))
     failed = sum(1 for r in results if r["status"] == "error")
-    context.log.info(f"  dbt Summary: {passed} passed, {failed} failed out of {len(results)} total")
+    context.log.info(
+        f"  dbt Summary: {passed} passed, {failed} failed out of {len(results)} total"
+    )
 
-    # Write to Snowflake
+    # Write per-model results to Snowflake
     conn = None
     try:
-        conn = snowflake.connector.connect(
-            user=os.getenv("SNOWFLAKE_USER"),
-            password=os.getenv("SNOWFLAKE_PASSWORD"),
-            account=os.getenv("SNOWFLAKE_ACCOUNT"),
-            warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
-            database="SANDBOX",
-            schema="METRICS",
-        )
+        conn = _snowflake_conn_sandbox()
         cursor = conn.cursor()
         dagster_run_id = context.dagster_run.run_id
 
@@ -147,12 +169,20 @@ def fetch_dbt_run_results(context):
                 VALUES (%s, %s, %s, %s, %s, %s,
                     CONVERT_TIMEZONE('America/Los_Angeles', 'Asia/Kolkata', CURRENT_TIMESTAMP()))
                 """,
-                (dagster_run_id, dbt_run_id, r["unique_id"],
-                 r["status"], rows_val, round(r["execution_time"], 2)),
+                (
+                    dagster_run_id,
+                    dbt_run_id,
+                    r["unique_id"],
+                    r["status"],
+                    rows_val,
+                    round(r["execution_time"], 2),
+                ),
             )
 
         conn.commit()
-        context.log.info(f"  Logged {len(results)} model results to SANDBOX.METRICS.DBT_MODEL_RUNS")
+        context.log.info(
+            f"  Logged {len(results)} model results to SANDBOX_PLUS.METRICS.DBT_MODEL_RUNS"
+        )
     except Exception as e:
         context.log.error(f"  Failed to log model results: {e}")
     finally:
@@ -160,10 +190,8 @@ def fetch_dbt_run_results(context):
             conn.close()
 
 # 4c. TRIGGER dbt RETRY JOB ON FAILURE
-def trigger_dbt_retry(context):
+def trigger_dbt_retry(context: RunStatusSensorContext):
     """Trigger the dbt retry job to rerun only failed models."""
-    import requests
-
     host = os.getenv("DBT_CLOUD_HOST")
     account_id = os.getenv("DBT_CLOUD_ACCOUNT_ID")
     token = os.getenv("DBT_CLOUD_API_TOKEN")
@@ -185,82 +213,80 @@ def trigger_dbt_retry(context):
     response.raise_for_status()
     run_id = response.json()["data"]["id"]
     context.log.info(f"  Retry job triggered! dbt Cloud Run ID: {run_id}")
-    context.log.info(f"  Only failed models from the last run will be re-executed.")
-
+    context.log.info("  Only failed models from the last run will be re-executed.")
 
 # 4d. LOG RECORD COUNTS TO SNOWFLAKE
-def log_record_counts(context):
+def log_record_counts(context: RunStatusSensorContext):
     """
     After every successful run:
     1. Query each layer table for current row count
     2. Look up previous run's row count from LAYER_ROW_COUNTS table
     3. Calculate rows added (current - previous)
-    4. Log to Dagster UI (visible in Automation tab)
-    5. Save to Snowflake LAYER_ROW_COUNTS table (full history)
+    4. Log to Dagster UI
+    5. Save to SANDBOX_PLUS.METRICS.LAYER_ROW_COUNTS
     """
     conn = None
     try:
-        conn = snowflake.connector.connect(
-            user=os.getenv("SNOWFLAKE_USER"),
-            password=os.getenv("SNOWFLAKE_PASSWORD"),
-            account=os.getenv("SNOWFLAKE_ACCOUNT"),
-            warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
-            database="DAGSTER_DBT_KIEWIT_DB",
-        )
+        conn = _snowflake_conn_main()
         cursor = conn.cursor()
         dagster_run_id = context.dagster_run.run_id
 
-        # All 4 layer tables we want to track
         tables = [
-            ("SOURCE", "CUSTOMER"),        # Seed layer
-            ("LZ", "RAW_CUSTOMERS"),       # Bronze layer
-            ("STAGING", "STG_CUSTOMERS"),   # Silver layer (VIEW)
-            ("DBO", "DIM_CUSTOMERS"),       # Gold layer
+            ("SOURCE", "CUSTOMER"),        # Seed
+            ("LZ", "RAW_CUSTOMERS"),      # Bronze
+            ("STAGING", "STG_CUSTOMERS"), # Silver
+            ("DBO", "DIM_CUSTOMERS"),     # Gold
         ]
 
         context.log.info("--- Record Counts ---")
         for schema, table in tables:
-
-            # Step 1: Get current row count
+            # 1. Current row count
             cursor.execute(f"SELECT COUNT(*) FROM {schema}.{table}")
             rows_after = cursor.fetchone()[0]
 
-            # Step 2: Get previous run's row count from tracking table
+            # 2. Previous row count from tracking table (SANDBOX_PLUS)
             cursor.execute(
                 """
-                SELECT ROWS_AFTER FROM SANDBOX.METRICS.LAYER_ROW_COUNTS
+                SELECT ROWS_AFTER FROM SANDBOX_PLUS.METRICS.LAYER_ROW_COUNTS
                 WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s
                 ORDER BY LOGGED_AT DESC LIMIT 1
                 """,
                 (schema, table),
             )
             prev = cursor.fetchone()
-            rows_before = prev[0] if prev else 0  # First run = 0
+            rows_before = prev[0] if prev else 0
 
-            # Step 3: Calculate difference
+            # 3. Difference
             rows_added = rows_after - rows_before
 
-            # Step 4: Save to Snowflake with IST timestamp
+            # 4. Insert into tracking table
             cursor.execute(
                 """
-                INSERT INTO SANDBOX.METRICS.LAYER_ROW_COUNTS
+                INSERT INTO SANDBOX_PLUS.METRICS.LAYER_ROW_COUNTS
                   (DAGSTER_RUN_ID, SCHEMA_NAME, TABLE_NAME,
                    ROWS_BEFORE, ROWS_AFTER, ROWS_ADDED, LOGGED_AT)
                 VALUES (%s, %s, %s, %s, %s, %s,
                     CONVERT_TIMEZONE('America/Los_Angeles', 'Asia/Kolkata', CURRENT_TIMESTAMP()))
                 """,
-                (dagster_run_id, schema, table,
-                 rows_before, rows_after, rows_added),
+                (
+                    dagster_run_id,
+                    schema,
+                    table,
+                    rows_before,
+                    rows_after,
+                    rows_added,
+                ),
             )
 
-            # Step 5: Log to Dagster UI
+            # 5. Log to Dagster UI
             context.log.info(
                 f"  {schema}.{table}: {rows_before:,} -> {rows_after:,} ({rows_added:+,} rows)"
             )
 
         conn.commit()
-        context.log.info("  Row counts logged to SANDBOX.METRICS.LAYER_ROW_COUNTS")
-
+        context.log.info(
+            "  Row counts logged to SANDBOX_PLUS.METRICS.LAYER_ROW_COUNTS"
+        )
     except Exception as e:
         context.log.error(f"Record count failed: {e}")
     finally:
@@ -268,19 +294,35 @@ def log_record_counts(context):
             conn.close()
 
 # 5. SENSORS (auto-start)
+
 @run_status_sensor(
     run_status=DagsterRunStatus.SUCCESS,
     default_status=DefaultSensorStatus.RUNNING,
 )
 def log_success_to_snowflake(context: RunStatusSensorContext):
+    """
+    On SUCCESS:
+    1. Log run to DAGSTER_JOB_RUNS
+    2. Fetch per-model dbt results -> DBT_MODEL_RUNS
+    3. Log row counts -> LAYER_ROW_COUNTS
+    """
     write_run_to_snowflake(context, status="SUCCESS")
-
+    try:
+        fetch_dbt_run_results(context)
+        log_record_counts(context)
+    except Exception as e:
+        context.log.warning(f"Could not fetch dbt Cloud details or log counts: {e}")
 
 @run_status_sensor(
     run_status=DagsterRunStatus.FAILURE,
     default_status=DefaultSensorStatus.RUNNING,
 )
 def log_failure_to_snowflake(context: RunStatusSensorContext):
+    """
+    On FAILURE:
+    1. Log run and error message to DAGSTER_JOB_RUNS
+    2. Trigger dbt retry job (dbt build --select result:error+)
+    """
     error_data = None
     if context.failure_event and context.failure_event.step_failure_data:
         error_data = {
@@ -292,31 +334,10 @@ def log_failure_to_snowflake(context: RunStatusSensorContext):
     except Exception as e:
         context.log.warning(f"Could not trigger retry job: {e}")
 
-
-
-@run_status_sensor(
-    run_status=DagsterRunStatus.SUCCESS,
-    default_status=DefaultSensorStatus.RUNNING,
-)
-def log_success_to_snowflake(context: RunStatusSensorContext):
-    write_run_to_snowflake(context, status="SUCCESS")
-    try:
-        fetch_dbt_run_results(context)
-        log_record_counts(context)
-    except Exception as e:
-        context.log.warning(f"Could not fetch dbt Cloud details: {e}")
-# This sensor fires after every SUCCESSFUL Dagster run
-# It does 3 things:
-# 1. Logs job status to DAGSTER_JOB_RUNS
-# 2. Fetches per-model results from dbt Cloud -> saves to DBT_MODEL_RUNS
-# 3. Counts rows in all layer tables -> saves to LAYER_ROW_COUNTS
-
-
 # 6. JOB + SCHEDULE
 run_customer_pipeline = define_asset_job(
     name="trigger_customer_dbt_cloud_job",
     selection=AssetSelection.all(),
-    executor_def=in_process_executor,
 )
 
 daily_schedule = ScheduleDefinition(
@@ -324,7 +345,6 @@ daily_schedule = ScheduleDefinition(
     cron_schedule="0 6 * * *",
     execution_timezone="UTC",
 )
-
 
 # 7. REGISTER EVERYTHING
 defs = Definitions(

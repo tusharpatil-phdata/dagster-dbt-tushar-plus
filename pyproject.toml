@@ -13,3 +13,6 @@ dependencies = [
     "cryptography",
     "requests",
 ]
+
+[tool.setuptools]
+packages = ["dagster"]

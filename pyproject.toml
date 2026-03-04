@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "customer_pipeline_plus"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
     "dagster",
     "dagster-cloud",
@@ -14,5 +14,5 @@ dependencies = [
     "requests",
 ]
 
-[tool.setuptools]
-packages = ["dagster_data"]
+[tool.setuptools.packages.find]
+include = ["dagster_data"]

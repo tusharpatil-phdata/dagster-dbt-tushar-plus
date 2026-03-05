@@ -1,17 +1,19 @@
+
+-- Gold layer: customer dimension in DBO schema
+
+
 {{
   config(
     materialized = 'table',
-    database     = 'DAGSTER_DBT_KIEWIT_DB',
-    schema       = 'dbo',
+    database     = 'DAGSTER_DBT_KIEWIT_DB_PLUS',
+    schema       = 'DBO',
     tags         = ['dbo', 'gold']
   )
 }}
 
-
 with customers as (
     select * from {{ ref('stg_customers') }}
 )
-
 
 select
     customer_id,

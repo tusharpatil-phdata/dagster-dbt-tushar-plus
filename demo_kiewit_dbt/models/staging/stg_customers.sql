@@ -1,17 +1,19 @@
+{{--
+  Silver layer: staging view for customers in STAGING schema
+--}}
+
 {{
   config(
     materialized = 'view',
-    database     = 'DAGSTER_DBT_KIEWIT_DB',
-    schema       = 'staging',
+    database     = 'DAGSTER_DBT_KIEWIT_DB_PLUS',
+    schema       = 'STAGING',
     tags         = ['staging', 'silver']
   )
 }}
 
-
 with source as (
     select * from {{ ref('raw_customers') }}
 ),
-
 
 cleaned as (
     select
@@ -49,7 +51,6 @@ cleaned as (
     where customer_id is not null
       and full_name   is not null
 ),
-
 
 deduped as (
     select *,

@@ -1,8 +1,8 @@
-name: demo_kiewit_dbt
+name: dagsterCloud-dbt-project
 version: '1.0.0'
 config-version: 2
 
-profile: default
+profile: dagsterCloud-dbt-project
 
 model-paths:    [models]
 seed-paths:     [seeds]
@@ -15,10 +15,10 @@ target-path: target
 clean-targets: [target, dbt_packages]
 
 seeds:
-  demo_kiewit_dbt:
+  dagsterCloud-dbt-project:
     customer:
-      +database: DAGSTER_DBT_KIEWIT_DB
-      +schema: source
+      +database: DAGSTER_DBT_KIEWIT_DB_PLUS
+      +schema: SOURCE
       +quote_columns: false
       +column_types:
         id: varchar(36)
@@ -26,22 +26,22 @@ seeds:
       +group: source
 
 models:
-  demo_kiewit_dbt:
+  dagsterCloud-dbt-project:
     lz:
-      +database: DAGSTER_DBT_KIEWIT_DB
-      +schema: lz
+      +database: DAGSTER_DBT_KIEWIT_DB_PLUS
+      +schema: LZ
       +materialized: table
       +tags: [lz, bronze]
       +group: bronze
     staging:
-      +database: DAGSTER_DBT_KIEWIT_DB
-      +schema: staging
+      +database: DAGSTER_DBT_KIEWIT_DB_PLUS
+      +schema: STAGING
       +materialized: view
       +tags: [staging, silver]
       +group: silver
     dbo:
-      +database: DAGSTER_DBT_KIEWIT_DB
-      +schema: dbo
+      +database: DAGSTER_DBT_KIEWIT_DB_PLUS
+      +schema: DBO
       +materialized: table
       +tags: [dbo, gold]
       +group: gold
